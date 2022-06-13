@@ -1,3 +1,1 @@
-abc
-xyz
-xyz
+0
