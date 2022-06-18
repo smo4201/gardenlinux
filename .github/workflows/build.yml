@@ -9,6 +9,6 @@ jobs:
         target: [ kvm, metal, gcp, aws, azure, ali, openstack, vmware, pxe ]
         modifier: [ "", "-dev" ]
     steps:
-      #- uses: actions/checkout@v2
-      #- run: make ARCH=${{ matrix.architecture }} BUILD_OPTS=--lessram ${{ matrix.target }}${{ matrix.modifier }}
-      - run: echo hello
+      - uses: actions/checkout@v2
+      - run: make ARCH=${{ matrix.architecture }} BUILD_OPTS=--lessram ${{ matrix.target }}${{ matrix.modifier }}
+      #- run: echo hello
