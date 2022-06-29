@@ -13,6 +13,7 @@ libpam-systemd
 lsb-release
 net-tools
 netbase
+nftables
 openssh-server
 procps
 sudo
