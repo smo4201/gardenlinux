@@ -1,0 +1,2 @@
+description: "AMD SEV-SNP confidential VM support"
+type: flag
