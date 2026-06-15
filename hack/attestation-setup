@@ -1,0 +1,193 @@
+#!/bin/bash
+
+set -e
+
+trap '[ $? -eq 0 ] && exit 0; printf "%s failed\n" "$0"' EXIT
+dir="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)"
+
+[[ $# -lt 2 ]] || {
+    echo "Usage: $(basename $0) [-d|--debug]"
+    exit 1
+}
+
+debug=0
+edk_output_dir="RELEASE_GCC5"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -d|--debug)
+            debug=1
+            edk_output_dir="DEBUG_GCC5"
+            shift
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+thirdparty="${dir}/thirdparty"
+
+qemu="${thirdparty}/qemu"
+edk2="${thirdparty}/edk2"
+cmc="${thirdparty}/cmc"
+
+mkdir -p "${thirdparty}"
+
+# Install prerequisites
+printf "[\033[34;1m EXEC \033[0m] Checking prerequisites..\n"
+packages=("build-essential" "nasm" "acpica-tools" "uuid-dev" "guestfs-tools" "guestmount" "libtasn1-dev" "libjson-glib-1.0-0" "libjson-glib-dev" "libgnutls28-dev" "socat" "libseccomp-dev" "moreutils" "golang-cfssl" "build-essential" "sqlite3" "zlib1g-dev" "libssl-dev" "jq" "genisoimage" "gnutls-bin" "git" "libglib2.0-dev" "libfdt-dev" "libpixman-1-dev" "zlib1g-dev" "ninja-build" "flex" "bison" "python-is-python3")
+for pkg in "${packages[@]}"; do
+    if ! dpkg-query -W -f='${Status}' "${pkg}" 2>/dev/null | grep -q "installed"; then
+        echo "Fatal: missing package: ${pkg}"
+	exit 1
+    fi
+done
+
+# Build QEMU
+[ -d "${qemu}" ] || {
+    printf "[\033[34;1m EXEC \033[0m] Building QEMU..\n"
+    git clone https://gitlab.com/qemu-project/qemu.git "${qemu}"
+    cd "${qemu}"
+    git checkout v10.2.0
+    git apply "${dir}/hack/0004-qemu-fw-cfg-file-dump.patch"
+
+    mkdir "${qemu}/build"
+    cd "${qemu}/build"
+
+    "${qemu}/configure" \
+        --target-list=x86_64-softmmu \
+        --enable-attr \
+        --enable-kvm \
+        --enable-vhost-net \
+        --enable-fdt \
+        --enable-user \
+        --enable-vhost-user \
+        --enable-slirp \
+        --disable-sdl \
+        --enable-tools \
+        --disable-fuse \
+        --disable-fuse-lseek \
+        --disable-seccomp \
+        --disable-libssh \
+        --disable-libusb \
+        --disable-vnc-jpeg \
+        --disable-vnc \
+        --disable-nettle \
+        --disable-numa \
+        --disable-spice \
+        --disable-usb-redir \
+        --disable-bpf \
+        --disable-brlapi \
+        --disable-bsd-user \
+        --disable-cap-ng \
+        --disable-capstone \
+        --disable-containers \
+        --disable-curl \
+        --disable-curses \
+        --disable-docs \
+        --disable-hvf \
+        --disable-libiscsi \
+        --disable-linux-aio \
+        --disable-linux-io-uring \
+        --disable-malloc-trim \
+        --disable-membarrier \
+        --disable-mpath \
+        --disable-netmap \
+        --disable-opengl \
+        --disable-rbd \
+        --disable-sparse \
+        --disable-strip \
+        --disable-vde \
+        --disable-vhost-crypto \
+        --disable-vhost-user-blk-server \
+        --disable-virtfs \
+        --disable-whpx \
+        --disable-xen
+
+    make -j$(nproc)
+}
+
+# Build edk2 OVMF firmware
+[ -d "${edk2}" ] || {
+    printf "[\033[34;1m EXEC \033[0m] Building edk2 firmware (%s)..\n" "${edk_output_dir}"
+    git clone https://github.com/tianocore/edk2.git "${edk2}"
+    cd "${edk2}"
+    git checkout edk2-stable202502
+    git submodule update --init
+
+    make -j "$(nproc)" -C BaseTools/
+
+    . ./edksetup.sh --reconfig
+
+    build_params=(  "-DTPM2_ENABLE=TRUE"
+                    "-DFD_SIZE_2MB"
+                    "-n $(nproc)"
+                    "-a X64"
+                    "-t GCC5"
+                    "-p OvmfPkg/OvmfPkgX64.dsc")
+
+    if [[ "${debug}" -eq 1 ]]; then
+        build_params+=("-b DEBUG"
+            "-DDEBUG_ON_SERIAL_PORT=TRUE")
+    else
+        build_params+=("-b RELEASE")
+    fi
+
+    # Build OVMF
+    build ${build_params[@]}
+}
+
+# Fetch attestation framework (host-side tools). This requires the same version as built into the
+# garden linux image
+cmc_release="$(sed -n 's/^CMC_RELEASE="${CMC_RELEASE:-\(.*\)}"$/\1/p' "${dir}/features/cmc/exec.config")"
+# Resolve "latest" to the tag it points at, so the installed release stays comparable against
+# ${cmc}/VERSION and the tools get replaced when upstream publishes a new one.
+if [ "${cmc_release}" = "latest" ]; then
+    cmc_release="$(curl -fsSL https://api.github.com/repos/Fraunhofer-AISEC/cmc/releases/latest | jq -r .tag_name)"
+    [ -n "${cmc_release}" ] && [ "${cmc_release}" != "null" ] || {
+        echo "Fatal: could not resolve the latest CMC release"
+        exit 1
+    }
+fi
+cmc_base="https://github.com/Fraunhofer-AISEC/cmc/releases/download/${cmc_release}"
+
+# Refetch when the installed tools are from a different release than requested
+[ ! -d "${cmc}" ] || [ "$(cat "${cmc}/VERSION" 2>/dev/null)" = "cmc-release=${cmc_release}" ] || {
+    printf "Replacing CMC tools (%s -> %s)..\n" \
+        "$(sed -n 's/^cmc-release=//p' "${cmc}/VERSION" 2>/dev/null)" "${cmc_release}"
+    rm -rf "${cmc}"
+}
+
+[ -d "${cmc}" ] || {
+    echo "Creating ${cmc} (cmc-release=${cmc_release})"
+    mkdir -p "${cmc}"
+    for tool in cmcd cmcctl tdxtool snptool estserver metatool mrtool; do
+        printf "Downloading %s...\n" "${tool}"
+        wget -qO "${cmc}/${tool}" "${cmc_base}/${tool}"
+        chmod +x "${cmc}/${tool}"
+    done
+    printf 'cmc-release=%s\n' "${cmc_release}" >"${cmc}/VERSION"
+}
+
+# Fetch vendor root CAs used for attestation CA-fingerprint pinning:
+# AMD ARK (Milan/Genoa/Turin) and the Intel SGX Provisioning Certification Root CA.
+# Mirrors ../connector/vendor/pki/download.sh; consumed by hack/attestation-generate-metadata.
+vendor_pki="${thirdparty}/vendor-pki"
+[ -d "${vendor_pki}" ] || {
+    echo "Creating ${vendor_pki}"
+    mkdir -p "${vendor_pki}/amd" "${vendor_pki}/intel"
+    for soc in Milan Genoa Turin; do
+        l="${soc,,}"
+        wget -O "${vendor_pki}/amd/chain_${l}.pem" "https://kdsintf.amd.com/vcek/v1/${soc}/cert_chain"
+        # The ARK (root) is the second certificate in the ASK -> ARK chain.
+        csplit -sz -f "${vendor_pki}/amd/${l}_" -b '%02d.pem' \
+            "${vendor_pki}/amd/chain_${l}.pem" '/-----BEGIN CERTIFICATE-----/' '{*}'
+        mv "${vendor_pki}/amd/${l}_01.pem" "${vendor_pki}/amd/ark_${l}.pem"
+        rm -f "${vendor_pki}/amd/${l}_00.pem" "${vendor_pki}/amd/chain_${l}.pem"
+    done
+    wget -O "${vendor_pki}/intel/Intel_SGX_Provisioning_Certification_RootCA.pem" \
+        "https://certificates.trustedservices.intel.com/Intel_SGX_Provisioning_Certification_RootCA.pem"
+}
+
+# Finished successfully
+printf "[\033[32;1m  OK  \033[0m] $0\n"
