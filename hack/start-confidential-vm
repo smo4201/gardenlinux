@@ -1,0 +1,93 @@
+#!/bin/bash
+
+set -euo pipefail
+
+trap 'rc=$?; [[ "${rc}" -eq 0 ]] || printf "[\033[31;1mFAILED\033[0m] %s\n" "$0"; exit "${rc}"' EXIT
+dir="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)"
+
+ovmf="${dir}/thirdparty/edk2/Build/OvmfX64/RELEASE_GCC5/FV/OVMF.fd"
+qemu="${dir}/thirdparty/qemu/build"
+build_dir="${dir}/.build"
+# --mac and --mem are measured into RTMR0 on TDX, so they have to match the
+# hack/attestation-generate-metadata invocation that produced the reference values.
+mac="02:00:00:ca:fe:01"
+mem="2Gi"
+# Port for attested tls
+atls_port="4443"
+driver=""
+image=""
+
+usage () {
+    printf "[start-cvm] Usage: start-confidential-vm [--snp|--tdx] [--image FILE] [--ovmf FILE]"
+    printf " [--mac ADDR] [--mem SIZE] [--atls-port PORT] [start-vm options...]\n"
+    exit "${1:-1}"
+}
+
+start_vm_args=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --snp) driver=snp; shift ;;
+        --tdx) driver=tdx; shift ;;
+        --image) image="$2"; shift 2 ;;
+        --ovmf) ovmf="$2"; shift 2 ;;
+        --mac) mac="$2"; shift 2 ;;
+        --mem) mem="$2"; shift 2 ;;
+        --atls-port) atls_port="$2"; shift 2 ;;
+        -h|--help) usage 0 ;;
+        *) start_vm_args+=("$1"); shift ;;
+    esac
+done
+
+# Detect the confidential computing technology of this host
+if [[ -z "${driver}" ]]; then
+    if [[ "$(cat /sys/module/kvm_amd/parameters/sev_snp 2>/dev/null)" == [Y1] ]]; then
+        driver=snp
+    elif [[ "$(cat /sys/module/kvm_intel/parameters/tdx 2>/dev/null)" == [Y1] ]]; then
+        driver=tdx
+    else
+        printf "[start-cvm] Neither SEV-SNP nor TDX is enabled on this host, use --snp/--tdx to force.\n"
+        exit 1
+    fi
+    printf "[start-cvm] Detected %s host\n" "${driver^^}"
+fi
+
+[[ -w /dev/kvm ]] || {
+    printf "[start-cvm] /dev/kvm is not writable, confidential guests require KVM.\n"
+    exit 1
+}
+
+[[ -f "${ovmf}" ]] || {
+    printf "[start-cvm] OVMF firmware not found: \`%s', try to run \`attestation-setup'.\n" "${ovmf}"
+    exit 1
+}
+
+# Default to the most recent image of the canonical flavor for this host
+if [[ -z "${image}" ]]; then
+    flavor="kvm_dev_${driver}-amd64"
+    mapfile -t images < <(ls -t "${build_dir}/${flavor}"-*.raw 2>/dev/null || true)
+    [[ "${#images[@]}" -gt 0 ]] || {
+        printf "[start-cvm] No image found, try to run \`./build %s'.\n" "${flavor}"
+        exit 1
+    }
+    image="${images[0]}"
+fi
+
+[[ -f "${image}" ]] || {
+    printf "[start-cvm] Image not found: \`%s'.\n" "${image}"
+    exit 1
+}
+
+# The patched QEMU from attestation-setup takes precedence over the system one
+[[ ! -d "${qemu}" ]] || PATH="${qemu}:${PATH}"
+
+printf "[start-cvm] Booting %s as %s guest (mac=%s mem=%s)\n" "${image}" "${driver^^}" "${mac}" "${mem}"
+
+# start-vm silently ignores flags placed after the image path, so it goes last
+exec "${dir}/bin/start-vm" \
+  "--${driver}" \
+  --cvm-fw "${ovmf}" \
+  --mac "${mac}" \
+  --mem "${mem}" \
+  --fwd "${atls_port}:4443" \
+  "${start_vm_args[@]}" \
+  "${image}"
