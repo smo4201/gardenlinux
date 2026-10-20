@@ -1,0 +1,317 @@
+#!/bin/bash
+
+set -euo pipefail
+
+dir="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)"
+export PATH="${dir}/thirdparty/cmc:${PATH}"
+
+cmc_dir="${dir}/.cmc"
+pki="${cmc_dir}/pki"
+build_dir="${dir}/.build"
+ovmf="${dir}/thirdparty/edk2/Build/OvmfX64/RELEASE_GCC5/FV/OVMF.fd"
+
+# These must match the guest that is going to be attested, i.e. the bin/start-vm invocation:
+# --ramsize reconstructs the TD HOB measured into RTMR0, --vcpus the VMSA measured into the SNP
+# launch digest. Both default to the bin/start-vm defaults.
+vcpus=2
+ram_size="2Gi"
+# MAC address of the guest NIC, without separators. OVMF derives a PXE boot entry from it, which
+# is measured into RTMR0, so it has to be pinned (bin/start-vm --mac) to be reproducible. Empty
+# means "keep whatever MAC the dumped Boot#### template was taken with".
+mac=""
+# Reference values are generated for the steady state, in which ignition has already removed its
+# first-boot arguments from the kernel command line. --firstboot generates them for the very
+# first boot of a freshly built image instead.
+firstboot=
+
+[[ $# -ge 1 ]] || {
+	printf 'Usage: %s <flavor> [--ovmf FILE] [--build-dir DIR] [--ramsize SIZE] [--vcpus N] [--mac ADDR] [--firstboot]\n' "${0##*/}" >&2
+	exit 1
+
+}
+flavor="$1"; shift
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--ovmf) ovmf="$2"; shift 2 ;;
+		--build-dir) build_dir="$2"; shift 2 ;;
+		--ramsize) ram_size="$2"; shift 2 ;;
+		--vcpus) vcpus="$2"; shift 2 ;;
+		--mac) mac="$(tr -d ':-' <<<"$2" | tr 'A-Z' 'a-z')"; shift 2 ;;
+		--firstboot) firstboot=1; shift ;;
+		*) printf 'unknown argument: %s\n' "$1" >&2; exit 1 ;;
+	esac
+done
+
+# Determine confidential-computing driver from the flavor name
+if [[ "${flavor}" == *snp* ]]; then
+	driver=snp
+elif [[ "${flavor}" == *tdx* ]]; then
+	driver=tdx
+else
+	printf 'error: flavor %q is neither snp nor tdx\n' "${flavor}" >&2
+	exit 1
+fi
+
+# Check required files
+[[ -d "${pki}" ]] || {
+	printf 'error: CMC PKI missing at %s\n' "${pki}" >&2
+	exit 1
+}
+[[ -n "${ovmf}" && -f "${ovmf}" ]] || {
+	printf 'error: OVMF firmware %s not found\n' "${ovmf}" >&2
+	exit 1
+}
+
+work="${cmc_dir}/input/${flavor}"
+signed="${cmc_dir}/signed"
+
+rm -rf "${work}"
+mkdir -p "${work}"
+mkdir -p "${signed}"
+
+now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+not_before="$(date -u -d '-1 day' +%Y-%m-%dT%H:%M:%SZ)"
+not_after="$(date -u -d '+2 years' +%Y-%m-%dT%H:%M:%SZ)"
+tmp="$(mktemp -d)"; trap 'rm -rf "${tmp}"' EXIT
+
+# UEFI boot variables (measured into PCR1/RTMR0 as EV_EFI_VARIABLE_BOOT), dumped from a running
+# guest by hack/attestation-dump-guest-refs.
+efivars="${dir}/config/cmc/efivars"
+efi_guid=8be4df61-93ca-11d2-aa0d-00e098032b8c
+bootorder_file="${efivars}/BootOrder-${efi_guid}"
+[[ -f "${bootorder_file}" ]] || {
+	printf 'error: %s missing, run hack/attestation-dump-guest-refs\n' "${bootorder_file}" >&2
+	exit 1
+}
+# Skip the 4-byte efivarfs attribute prefix, then read little-endian UINT16 boot option numbers.
+hex=$(xxd -p "${bootorder_file}" | tr -d '\n' | cut -c9-)
+ids=()
+while [[ ${#hex} -ge 4 ]]; do
+    ids+=( "$(( 0x${hex:2:2}${hex:0:2} ))" )
+    hex=${hex:4}
+done
+printf '[metadata] BootOrder: %s\n' "${ids[*]}"
+
+bootorder_arg=$(IFS=,; echo "${ids[*]}")
+bootargs=""
+for n in "${ids[@]}"; do
+	src="${efivars}/Boot$(printf '%04X' "$n")-${efi_guid}"
+	[[ -f "${src}" ]] || { printf 'error: %s missing, run hack/attestation-dump-guest-refs\n' "${src}" >&2; exit 1; }
+	# The PXE boot entry embeds the NIC MAC, which QEMU randomises unless start-vm --mac pins it,
+	# so rewrite the pinned MAC into the dumped template rather than requiring a fresh dump. The
+	# helper reports what it rewrote on stderr and passes entries without a MAC through unchanged.
+	dst="${tmp}/$(basename "${src}")"
+	if [[ -n "${mac}" ]]; then
+		python3 -I "${dir}/hack/attestation-patch-bootvar-mac" "${src}" "${mac}" >"${dst}"
+	else
+		cp "${src}" "${dst}"
+	fi
+	bootargs+="${dst},"
+done
+bootargs=${bootargs%,}
+
+printf '[metadata] flavor=%s driver=%s ovmf=%s\n' "${flavor}" "${driver}" "${ovmf}"
+
+# SNP accepted firmware/TCB versions.
+generate_snp_policies () {
+	local out="$1"
+	metatool create snp-version --name milan \
+		--fw-major 1 --fw-minor 55 --fw-build 14 \
+		--tcb-bl 2 --tcb-tee 0 --tcb-snp 18 --tcb-ucode 115 \
+		--out "${out}/milan.json" --format json
+	metatool create snp-version --name genoa \
+		--fw-major 1 --fw-minor 55 --fw-build 39 \
+		--tcb-bl 8 --tcb-tee 0 --tcb-snp 23 --tcb-ucode 21 \
+		--out "${out}/genoa.json" --format json
+	metatool create snp-version --name turin \
+		--fw-major 1 --fw-minor 55 --fw-build 61 \
+		--tcb-fmc 0 --tcb-bl 1 --tcb-tee 0 --tcb-snp 2 --tcb-ucode 71 \
+		--out "${out}/turin.json" --format json
+	metatool create snp-policy \
+		--report-min-version 2 --report-max-version 5 --smt \
+		--versions "${out}/milan.json,${out}/genoa.json,${out}/turin.json" \
+		--out "${out}/snp-policy.json" --format json
+}
+
+# SHA-256 fingerprint of a PEM cert
+vendor_pki="${dir}/thirdparty/vendor-pki"
+cert_fingerprint () {
+	[[ -f "$1" ]] || { printf 'error: vendor CA cert missing: %s (run hack/attestation-setup)\n' "$1" >&2; exit 1; }
+	openssl x509 -in "$1" -fingerprint -noout -sha256 | sed 's/://g' | cut -d= -f2
+}
+
+# RTM manifest: hardware and firmware reference values (+ attestation policy)
+printf '[metadata] Precomputing %s reference values\n' "${driver}"
+policy_args=()
+if [[ "${driver}" == snp ]]; then
+	mrtool precompute snp --ovmf "${ovmf}" --vcpus "${vcpus}" >"${tmp}/components.json"
+
+	generate_snp_policies "${tmp}"
+	policy_args+=(--snp-policy "${tmp}/snp-policy.json")
+
+	# Pin the AMD ARK root CAs (Milan/Genoa/Turin) so the SNP cert chain anchors to
+	# genuine AMD roots
+	ca_fingerprints=""
+	for ark in ark_milan ark_genoa ark_turin; do
+		ca_fingerprints="${ca_fingerprints:+${ca_fingerprints},}$(cert_fingerprint "${vendor_pki}/amd/${ark}.pem")"
+	done
+	policy_args+=(--ca-fingerprints "${ca_fingerprints}")
+else
+	# MRSEAM records the hash of the TDX module the host loaded, so it cannot be derived from the
+	# build. Accept every TDX module from 1.5.34 on. TODO configuration and update policy.
+	mrseams=(
+		2d2de102461684f14c8d0984a09d895e3e9e15944ce020a03b977e1f114d5e1ed32ef666a47fd19a5851b3800eda3afa # 2.0.18
+		f40772d82608da5443887dd7247be3e0092927e62409a9bb8da98eaed9017704be075466a13d3ca30501000d69407495 # 2.0.16
+		aef4ed3e686fe6cf44c9a8d1cc63105443b558ac4f40c282abf78271e9a4586c50408c8584c7b43fd21edb736700ba5f # 2.0.14
+		87bdf50356b95e264a5d0807016b9b8ab7568d0857d27eddbe847f98184a786e0f3eecf2fabd3b6d23f71f2ae50300f4 # 2.0.12
+		476a2997c62bccc78370913d0a80b956e3721b24272bc66c4d6307ced4be2865c40e26afac75f12df3425b03eb59ea7c # 2.0.08
+		64cae497e0c6221176fe8d3bc9d0cf25b4c97bb24cc16499f77102451f15bb24249f1aa3e5d3bf8897be74ad6c84e648 # 2.0.04
+		685f891ea5c20e8fa27b151bf34bf3b50fbaf7143cc53662727cbdb167c0ad8385f1f6f3571539a91e104a1c96d75e04 # 2.0.02
+		ab62561a173acbd18ee50ff37750db44184c6cf5e886df74247cc575e163b04c34b9e18374757c235affa614d4127f6b # 1.5.34
+	)
+	[[ -z "${MRSEAM:-}" ]] || IFS=',' read -r -a mrseams <<<"${MRSEAM}"
+	printf '[metadata] Accepting %d TDX module MRSEAM values\n' "${#mrseams[@]}"
+	seam_args=()
+	for h in "${mrseams[@]}"; do seam_args+=(--mrseam "${h}"); done
+
+	mrtool precompute tdx \
+		--mrs 0,1,5 \
+		"${seam_args[@]}" \
+		--ovmf "${ovmf}" \
+		--ramsize "${ram_size}" \
+		--acpirsdp "${dir}/config/cmc/fw-cfg/etc-acpi-rsdp" \
+        --acpitables "${dir}/config/cmc/fw-cfg/etc-acpi-tables" \
+        --tableloader "${dir}/config/cmc/fw-cfg/etc-table-loader" \
+		--bootorder "${bootorder_arg}" \
+        --bootxxxx "${bootargs}" \
+		>"${tmp}/components.json"
+
+	# TDX policy. TODO xfam alternatives
+	mrowner="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+	metatool create tdx-policy \
+		--quote-version 4 \
+		--sept-ve-disable \
+		--mr-owner "${mrowner}" \
+		--mr-owner-config "${mrowner}" \
+		--mr-config-id "${mrowner}" \
+		--xfam "e702060000000000" \
+		--accepted-tcb-statuses "UpToDate,OutOfDate" \
+		--out "${tmp}/tdx-policy.json" --format json
+	policy_args+=(--tdx-policy "${tmp}/tdx-policy.json")
+
+	# Pin the Intel SGX Provisioning Certification Root CA.
+	policy_args+=(--ca-fingerprints "$(cert_fingerprint "${vendor_pki}/intel/Intel_SGX_Provisioning_Certification_RootCA.pem")")
+fi
+
+metatool create manifest \
+	--name "${flavor}.rtm" \
+	--version "${now}" \
+	--developer-common-name "Garden Linux" \
+	--not-before "${not_before}" --not-after "${not_after}" \
+	--description "${flavor} RTM manifest" \
+	--cert-level 3 \
+	--base-layers "${flavor}.rtm" \
+	--components "${tmp}/components.json" \
+	"${policy_args[@]}" \
+	--out "${work}/${flavor}.rtm.manifest" --format json
+
+# OS manifest: derive GPT, bootloader, kernel, cmdline and initrd reference values (RTMR1 and
+# RTMR2) from the built artifacts.
+tarball="$(ls "${build_dir}/${flavor}"-*.tar 2>/dev/null | head -n1 || true)"
+[[ -n "${tarball}" ]] || { printf 'error: no %s-*.tar in %s\n' "${flavor}" "${build_dir}" >&2; exit 1; }
+printf '[metadata] Extracting boot chain from %s\n' "${tarball##*/}"
+extract="${cmc_dir}/boot/${flavor}"
+rm -rf "${extract}"; mkdir -p "${extract}"
+tar -xf "${tarball}" -C "${extract}" --wildcards \
+	'efi/EFI/BOOT/BOOTX64.EFI' 'efi/Default/*/linux' 'efi/Default/*/initrd' 'efi/loader/entries/*.conf'
+
+bootloader="${extract}/efi/EFI/BOOT/BOOTX64.EFI"
+entry="$(ls "${extract}"/efi/loader/entries/*.conf 2>/dev/null | head -n1)"
+[[ -f "${bootloader}" && -n "${entry}" ]] || {
+	printf 'error: image %s has no systemd-boot ESP layout\n' "${tarball##*/}" >&2
+	exit 1
+}
+kernel="${extract}/efi$(awk '$1=="linux"  {print $2}' "${entry}")"
+initrd="${extract}/efi$(awk '$1=="initrd" {print $2}' "${entry}")"
+options="$(sed -n 's/^options[[:space:]]*//p' "${entry}")"
+initrd_efipath="$(awk '$1=="initrd" {gsub("/","\\",$2); print $2}' "${entry}")"
+if [[ -z "${firstboot}" ]]; then
+	# ignition-disable.service drops /etc/kernel/cmdline.d/50-ignition.cfg and regenerates the
+	# entry after the first boot, so every later boot measures a command line without these.
+	options="$(sed -E 's/ ?ignition\.(firstboot|platform\.id)=[^ ]*//g' <<<"${options}")"
+fi
+# systemd-boot measures the LoadOptions exactly as it passes them: "initrd=<path> <options>".
+printf '%s' "initrd=${initrd_efipath} ${options}" >"${tmp}/cmdline"
+printf '[metadata] Kernel  : %s\n' "${kernel#"${extract}/efi"}"
+printf '[metadata] Cmdline : %s\n' "$(cat "${tmp}/cmdline")"
+
+# The GPT of the boot disk is measured as EV_EFI_GPT_EVENT into RTMR1. Protective MBR + GPT
+# header + the 128-entry partition array occupy the first 34 LBAs of the raw image.
+raw="$(ls "${build_dir}/${flavor}"-*.raw 2>/dev/null | head -n1 || true)"
+gpt_arg=()
+if [[ -n "${raw}" ]]; then
+	dd if="${raw}" of="${tmp}/gpt.bin" bs=512 count=34 status=none
+	gpt_arg=(--gpt "${tmp}/gpt.bin")
+else
+	printf '[metadata] warning: no %s-*.raw, skipping EV_EFI_GPT_EVENT reference value\n' "${flavor}" >&2
+fi
+
+printf '[metadata] Precomputing OS reference values\n'
+
+# RTMR1: OVMF measures the EFI action and separator, the GPT of the boot disk, systemd-boot and
+# the kernel.
+# RTMR2: the LoadOptions, recorded twice (EV_IPL and EV_EVENT_TAG), and the initrd.
+mrtool precompute tdx --mrs 2,3 \
+	"${gpt_arg[@]}" \
+	--bootloaders "${bootloader}" \
+	--kernel "${kernel}" \
+	--initrd "${initrd}" \
+	--cmdline "${tmp}/cmdline" \
+	--separator-first \
+	>"${tmp}/os-components.json"
+
+metatool create manifest \
+	--name "${flavor}.os" \
+	--version "${now}" \
+	--developer-common-name "Garden Linux" \
+	--not-before "${not_before}" --not-after "${not_after}" \
+	--description "${flavor} OS manifest" \
+	--base-layers "${flavor}.rtm" \
+	$( [[ -s "${tmp}/os-components.json" ]] && printf -- '--components %s' "${tmp}/os-components.json" ) \
+	--out "${work}/${flavor}.os.manifest" --format json
+
+# Image description
+desc_args=()
+for m in "${work}"/*.manifest; do
+	[[ -e "${m}" ]] || continue
+	name="$(basename "${m}" .manifest)"
+	metatool create manifest-description --name "${name}.description" --manifest "${name}" \
+		--out "${tmp}/${name}.manifest-description" --format json
+	desc_args+=("${tmp}/${name}.manifest-description")
+done
+metatool create image-description \
+	--name "${flavor}" \
+	--version "${now}" \
+	--not-before "${not_before}" --not-after "${not_after}" \
+	--description "${flavor} image description" \
+	$( [[ ${#desc_args[@]} -gt 0 ]] && printf -- '--descriptions %s' "$(IFS=,; echo "${desc_args[*]}")" ) \
+	--out "${work}/${flavor}.image.description" --format json
+
+# Sign all metadata
+out="${signed}/${flavor}"
+rm -rf "${out}"; mkdir -p "${out}"
+
+sign () {
+	metatool sign --in "$1" --out "${out}/$(basename "$1")" --keys "$2" --x5cs "$3"
+}
+
+CHAIN_OP="${pki}/operator.pem,${pki}/user_sub_ca.pem,${pki}/ca.pem"
+CHAIN_DEV="${pki}/developer.pem,${pki}/user_sub_ca.pem,${pki}/ca.pem"
+
+sign "${work}/${flavor}.image.description" "${pki}/operator-key.pem" "${CHAIN_OP}"
+for m in "${work}"/*.manifest; do
+	[[ -e "${m}" ]] || continue
+	sign "${m}" "${pki}/developer-key.pem" "${CHAIN_DEV}"
+done
+
+printf '[metadata] Signed metadata written to %s\n' "${out}"

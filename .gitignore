@@ -1,4 +1,6 @@
 /.build
+/.cmc
+/thirdparty
 /.buildlogs
 /.packages
 /.repository
@@ -8,6 +10,7 @@
 /features/_dev/id_dev
 /features/_dev/id_dev.pub
 /features/_dev/file.include/authorized_keys
+/features/cmc/file.include/var/ca.pem
 /cert/cfssl
 /cert/*.key
 /cert/*.arn

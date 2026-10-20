@@ -1,0 +1,5 @@
+markers:
+  "etc/systemd/system/cmcd.service":
+  - "GL-TESTCOV-cmc-service-cmcd-unit"
+  "etc/cmcctl-conf.json":
+  - "GL-TESTCOV-cmc-config-cmcctl-conf"

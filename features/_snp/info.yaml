@@ -1,2 +1,4 @@
 description: "AMD SEV-SNP confidential VM support"
 type: flag
+features:
+  include: [ cmc ]

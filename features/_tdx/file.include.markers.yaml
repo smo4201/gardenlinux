@@ -1,0 +1,3 @@
+markers:
+  "etc/cmcd-conf.json":
+  - "GL-TESTCOV-_tdx-config-cmcd-conf"

@@ -1,0 +1,17 @@
+{
+  "CN": "Garden Linux CMC Root CA",
+  "key": {
+    "algo": "ecdsa",
+    "size": 521
+  },
+  "names": [
+    {
+      "C": "DE",
+      "O": "Garden Linux",
+      "OU": "CMC Attestation"
+    }
+  ],
+  "expiry": "87660h",
+  "usages": ["cert sign"],
+  "ca_constraint": {"is_ca": true}
+}

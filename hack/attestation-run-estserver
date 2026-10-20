@@ -1,0 +1,11 @@
+#!/bin/bash
+
+set -euo pipefail
+
+dir="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)"
+cd "${dir}"
+
+estserver="${dir}/thirdparty/cmc/estserver"
+config="${dir}/config/cmc/est-server-conf.json"
+
+exec "${estserver}" -config "${config}" "$@"

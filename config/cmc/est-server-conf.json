@@ -1,0 +1,20 @@
+{
+    "estAddr": "0.0.0.0:9001",
+    "estCaKey": ".cmc/pki/device_sub_ca-key.pem",
+    "estCaChain": [
+        ".cmc/pki/device_sub_ca.pem",
+        ".cmc/pki/ca.pem"
+    ],
+    "tlsKey": ".cmc/pki/est-tls-key.pem",
+    "tlsCaChain": [
+        ".cmc/pki/est-tls.pem",
+        ".cmc/pki/ca.pem"
+    ],
+    "rootCas": [
+        ".cmc/pki/ca.pem"
+    ],
+    "httpFolder": ".cmc/signed",
+    "verifyEkCert": false,
+    "logLevel": "trace",
+    "authMethods": [ "none" ]
+}

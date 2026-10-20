@@ -1,0 +1,54 @@
+#!/bin/bash
+# Dump the host/firmware-dependent reference value inputs from a running confidential guest.
+#
+# A few of the values measured into RTMR0 are properties of the QEMU/OVMF configuration rather
+# than of the Garden Linux image, so they cannot be derived from the build artifacts:
+#
+#   config/cmc/fw-cfg/*   the QEMU ACPI blobs (etc/table-loader, etc/acpi/rsdp, etc/acpi/tables),
+#                         measured as EV_PLATFORM_CONFIG_FLAGS. They depend on the machine type
+#                         and the device/CPU/memory topology, i.e. on the start-vm invocation.
+#   config/cmc/efivars/*  the UEFI BootOrder and Boot#### variables, measured as
+#                         EV_EFI_VARIABLE_BOOT. They depend on the boot devices OVMF enumerates.
+#
+# Re-run this whenever the QEMU command line of the confidential guest changes. The boot entry of
+# the PXE NIC embeds the NIC's MAC address; attestation-generate-metadata patches the pinned MAC
+# into the dumped template, so the dump stays valid across runs with different MACs.
+
+set -euo pipefail
+
+dir="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)"
+ssh_cmd="${dir}/hack/devsshvm"
+fwcfg="${dir}/config/cmc/fw-cfg"
+efivars="${dir}/config/cmc/efivars"
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--ssh) ssh_cmd="$2"; shift 2 ;;
+		*) printf 'usage: %s [--ssh COMMAND]\n' "${0##*/}" >&2; exit 1 ;;
+	esac
+done
+
+# sysfs reports st_size 0 for fw_cfg blobs, so they have to be streamed rather than copied.
+fetch () {
+	"${ssh_cmd}" "sudo cat '$1' | base64 -w0" | base64 -d
+}
+
+mkdir -p "${fwcfg}" "${efivars}"
+
+printf '[dump-guest-refs] Fetching QEMU fw_cfg ACPI blobs\n'
+for f in table-loader acpi/rsdp acpi/tables; do
+	out="${fwcfg}/etc-${f//\//-}"
+	fetch "/sys/firmware/qemu_fw_cfg/by_name/etc/${f}/raw" >"${out}"
+	[[ -s "${out}" ]] || { printf 'error: empty dump %s (is CONFIG_FW_CFG_SYSFS enabled?)\n' "${out}" >&2; exit 1; }
+	printf '  %-20s %7d bytes  sha384=%s\n' "${out##*/}" "$(stat -c%s "${out}")" "$(sha384sum "${out}" | cut -c1-16)…"
+done
+
+printf '[dump-guest-refs] Fetching UEFI boot variables\n'
+guid=8be4df61-93ca-11d2-aa0d-00e098032b8c
+names="$("${ssh_cmd}" "ls /sys/firmware/efi/efivars/ | grep -E '^(BootOrder|Boot[0-9A-F]{4})-${guid}\$'" | tr -d '\r')"
+for name in ${names}; do
+	fetch "/sys/firmware/efi/efivars/${name}" >"${efivars}/${name}"
+	printf '  %-50s %4d bytes\n' "${name%%-*}" "$(stat -c%s "${efivars}/${name}")"
+done
+
+printf '[dump-guest-refs] Wrote %s and %s\n' "${fwcfg#"${dir}"/}" "${efivars#"${dir}"/}"

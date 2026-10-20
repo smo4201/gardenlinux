@@ -1,1 +1,21 @@
-{}
+{
+    "cmcAddr": "/run/cmcd.sock",
+    "hashAlg": "SHA256",
+    "api": "socket",
+    "logLevel": "trace",
+    "storage": "/var/cmc/storage",
+    "cache": "/var/cmc/cache",
+    "peerCache": "/var/cmc/peer-cache",
+    "vendorCache": "/var/cmc/vendor-cache",
+    "rootCas": [
+        "/var/ca.pem"
+    ],
+    "allowSystemCerts": true,
+    "measurementLogs": true,
+    "provisionAuth": [ "none" ],
+    "endorsementMode": "direct",
+    "enrollmentMode": "est",
+    "enrollmentAddr": "https://10.0.2.2:9001/",
+    "metadata": [ "https://10.0.2.2:9001/signed/kvm_dev_tdx-amd64" ],
+    "drivers": [ "TDX" ]
+}

@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""Repin the NIC MAC address inside a dumped UEFI Boot#### variable.
+
+OVMF auto-creates a PXE boot option for every NIC it enumerates, and measures it into RTMR0 as
+EV_EFI_VARIABLE_BOOT. The option embeds the MAC twice: in its UTF-16LE description
+("UEFI PXEv4 (MAC:0221C2872154)") and in the MAC messaging device path node. QEMU randomises the
+MAC per run unless bin/start-vm --mac pins it, which would otherwise make that reference value
+unreproducible. Rewriting the dumped template avoids having to re-dump it for every MAC.
+
+Boot options that carry no MAC (disk, shell, UiApp) are passed through unchanged.
+
+Usage: attestation-patch-bootvar-mac <boot-var-file> <new-mac>   (MAC as 12 hex digits)
+"""
+import re
+import sys
+
+
+def main():
+    if len(sys.argv) != 3:
+        sys.exit(__doc__)
+    path, new = sys.argv[1], sys.argv[2].lower()
+    if not re.fullmatch("[0-9a-f]{12}", new):
+        sys.exit(f"error: {sys.argv[2]!r} is not a MAC address of 12 hex digits")
+
+    data = open(path, "rb").read()
+    # The description is UTF-16LE, so decode leniently and look for the "(MAC:...)" marker.
+    found = re.search(r"\(MAC:([0-9A-Fa-f]{12})\)", data.decode("utf-16-le", "ignore"))
+    if not found:
+        sys.stdout.buffer.write(data)
+        return
+    old = found.group(1).lower()
+    if old == new:
+        sys.stdout.buffer.write(data)
+        return
+
+    patched = data.replace(old.upper().encode("utf-16-le"), new.upper().encode("utf-16-le"))
+    patched = patched.replace(bytes.fromhex(old), bytes.fromhex(new))
+    if patched.count(bytes.fromhex(new)) != 1:
+        sys.exit(f"error: could not rewrite MAC device path node in {path}")
+    print(f"[metadata] {path.rsplit('/', 1)[-1].split('-')[0]}: repinning MAC {old} -> {new}", file=sys.stderr)
+    sys.stdout.buffer.write(patched)
+
+
+main()

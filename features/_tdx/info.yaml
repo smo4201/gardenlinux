@@ -1,2 +1,4 @@
 description: "Intel TDX confidential VM support"
 type: flag
+features:
+  include: [ cmc ]

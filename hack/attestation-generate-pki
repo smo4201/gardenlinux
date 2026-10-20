@@ -1,0 +1,60 @@
+#!/bin/bash
+
+#
+# Generate example PKI for attestation
+#
+# TODO: evaluate if gardenlinux PKI can be used for this
+#
+
+set -euo pipefail
+
+dir="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)"
+
+config="${dir}/config/cmc/pki"
+out="${dir}/.cmc/pki"
+
+rm -rf "${out}"
+mkdir -p "${out}"
+
+printf '[pki] Generating CMC PKI in %s\n' "${out}"
+
+# 1. Root CA
+cfssl gencert -initca "${config}/ca.json" | cfssljson -bare "${out}/ca"
+
+# 2. Intermediate CAs (device + user), signed by root
+cfssl genkey "${config}/device_sub_ca.json" | cfssljson -bare "${out}/device_sub_ca"
+cfssl sign -ca "${out}/ca.pem" -ca-key "${out}/ca-key.pem" \
+	--config "${config}/ca-config.json" -profile intermediate \
+	"${out}/device_sub_ca.csr" | cfssljson -bare "${out}/device_sub_ca"
+
+cfssl genkey "${config}/user_sub_ca.json" | cfssljson -bare "${out}/user_sub_ca"
+cfssl sign -ca "${out}/ca.pem" -ca-key "${out}/ca-key.pem" \
+	--config "${config}/ca-config.json" -profile intermediate \
+	"${out}/user_sub_ca.csr" | cfssljson -bare "${out}/user_sub_ca"
+
+# 3. Metadata signer certs (developer + operator), signed by the user SubCA.
+gen_user () {
+	cfssl genkey -config "${config}/ca-config.json" -profile user "${config}/$1.json" \
+		| cfssljson -bare "${out}/$1"
+	cfssl sign -ca "${out}/user_sub_ca.pem" -ca-key "${out}/user_sub_ca-key.pem" \
+		--config "${config}/ca-config.json" -profile user \
+		"${out}/$1.csr" | cfssljson -bare "${out}/$1"
+}
+gen_user developer
+gen_user operator
+
+# 4. EST server TLS cert, signed by root
+cfssl genkey -config "${config}/ca-config.json" -profile tlscert "${config}/est-tls.json" \
+	| cfssljson -bare "${out}/est-tls"
+cfssl sign -ca "${out}/ca.pem" -ca-key "${out}/ca-key.pem" \
+	--config "${config}/ca-config.json" -profile tlscert \
+	"${out}/est-tls.csr" | cfssljson -bare "${out}/est-tls"
+
+chmod 600 "${out}"/*-key.pem
+
+# Bake the root CA cert into the cmc feature so it lands at /var/ca.pem in the image
+anchor="${dir}/features/cmc/file.include/var/ca.pem"
+mkdir -p "$(dirname "${anchor}")"
+cp "${out}/ca.pem" "${anchor}"
+
+printf '[pki] Done.\n'

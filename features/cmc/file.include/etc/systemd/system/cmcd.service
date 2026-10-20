@@ -1,0 +1,18 @@
+[Unit]
+Description=CMC attestation daemon (cmcd)
+Documentation=https://github.com/Fraunhofer-AISEC/cmc
+Wants=network-online.target
+After=network-online.target
+# The CMC root CA (trust anchor) must be baked into the image.
+ConditionPathExists=/var/ca.pem
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=10
+User=root
+ExecStartPre=/bin/mkdir -p /var/cmc/storage /var/cmc/cache /var/cmc/peer-cache /var/cmc/vendor-cache
+ExecStart=/usr/bin/cmcd -config /etc/cmcd-conf.json
+
+[Install]
+WantedBy=multi-user.target

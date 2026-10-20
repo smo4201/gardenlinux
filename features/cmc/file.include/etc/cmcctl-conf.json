@@ -1,0 +1,19 @@
+{
+    "addr": "0.0.0.0:4443",
+    "cmcAddr": "/run/cmcd.sock",
+    "report": "/var/attestation-report",
+    "result": "/var/attestation-result.json",
+    "nonce": "/var/nonce",
+    "rootCas": [
+        "/var/ca.pem"
+    ],
+    "caStorePath": "/var/ca.pem",
+    "mtls": false,
+    "attest": "server",
+    "api": "socket",
+    "serialization": "cbor",
+    "logLevel": "trace",
+    "keyConfig": "EC256",
+    "keyType": "sw",
+    "keyId": "/var/key_id"
+}

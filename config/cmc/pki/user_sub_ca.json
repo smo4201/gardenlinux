@@ -1,0 +1,14 @@
+{
+  "CN": "Garden Linux CMC User SubCA",
+  "names": [
+    {
+      "C": "DE",
+      "O": "Garden Linux",
+      "OU": "User SubCA"
+    }
+  ],
+  "key": {
+    "algo": "ecdsa",
+    "size": 384
+  }
+}
