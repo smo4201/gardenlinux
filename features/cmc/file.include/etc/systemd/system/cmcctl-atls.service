@@ -1,0 +1,14 @@
+[Unit]
+Description=Attested TLS server
+Wants=network-online.target cmcd.service
+After=network-online.target cmcd.service
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=10
+User=root
+ExecStart=/usr/bin/cmcctl listen --config /etc/cmcctl-conf.json
+
+[Install]
+WantedBy=multi-user.target

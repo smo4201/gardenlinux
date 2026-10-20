@@ -132,6 +132,20 @@ cmcctl verify   -config /etc/cmcctl-conf.json   # verify  -> /var/attestation-re
 `cmcd` caches the metadata it fetched from the EST server, so after regenerating reference values
 restart it (`systemctl restart cmcd`) before attesting again.
 
+### Attested TLS
+
+`cmcctl-atls.service` serves attested TLS in the guest on port 4443, which the `cmc` feature opens
+in the firewall via `/etc/nft.d/cmc.conf`.
+`hack/attestation-run-atls` attests the Garden Linux CVM through establishing an attestedTLS
+channel to the CVM:
+```sh
+./hack/attestation-run-atls [<guest-address>[:<port>]]
+```
+
+`start-confidential-vm` forwards the port to the host, so without arguments the script connects to
+`127.0.0.1:4443`. Use `--atls-port` to forward to a different host port when running several
+guests.
+
 ### Reference Values
 
 `attestation-generate-metadata` writes two manifests. The RTM manifest covers what the platform

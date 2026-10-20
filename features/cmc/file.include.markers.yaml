@@ -1,5 +1,9 @@
 markers:
   "etc/systemd/system/cmcd.service":
   - "GL-TESTCOV-cmc-service-cmcd-unit"
+  "etc/systemd/system/cmcctl-atls.service":
+  - "GL-TESTCOV-cmc-service-cmcctl-atls-unit"
   "etc/cmcctl-conf.json":
   - "GL-TESTCOV-cmc-config-cmcctl-conf"
+  "etc/nft.d/cmc.conf":
+  - "GL-TESTCOV-cmc-firewall-atls-port"

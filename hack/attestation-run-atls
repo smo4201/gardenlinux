@@ -1,0 +1,117 @@
+#!/bin/bash
+
+set -euo pipefail
+
+scratch=""
+rc=0
+trap 'rc=$?; [[ -z "${scratch}" ]] || rm -rf "${scratch}"; [[ "${rc}" -eq 0 ]] || printf "[\033[31;1mFAILED\033[0m] %s\n" "$0"; exit "${rc}"' EXIT
+dir="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)"
+case "${PATH}" in ""|"${dir}/bin:"*) ;; *) PATH="${dir}/bin:${PATH}";; esac
+
+# Usage: test-atls [ADDR[:PORT]] [cmcctl-options...]
+# Defaults to the port hack/start-confidential-vm forwards out of the guest. QEMU binds the
+# forward on IPv4 only, so do not rely on localhost resolving to 127.0.0.1 first.
+addr="127.0.0.1"
+case "${1-}" in
+  ""|-*) ;;
+  *)     addr="$1"; shift ;;
+esac
+
+# The cmcctl-atls service of the CVMs listens on port 4443 by default
+case "${addr}" in
+  \[*\]:*) ;;                          # [IPv6]:port
+  \[*\])   addr="${addr}:4443";;       # [IPv6]
+  *:*:*)   addr="[${addr}]:4443";;     # IPv6 without brackets
+  *:*)     ;;                          # host:port
+  *)       addr="${addr}:4443";;
+esac
+
+cmcctl="${dir}/thirdparty/cmc/cmcctl"
+[[ -x "${cmcctl}" ]] || {
+    printf "[test-atls] cmcctl not found: \`%s', try to run \`attestation-setup'.\n" "${cmcctl}"
+    exit 1
+}
+
+ca="${dir}/.cmc/pki/ca.pem"
+[[ -f "${ca}" ]] || {
+    printf "[test-atls] Root CA not found: \`%s', try to run \`generate-pki'.\n" "${ca}"
+    exit 1
+}
+
+# Publishing the attestation result and add verification policy if given
+extra_args=()
+token="${dir}/.cmc/cvm-base-token"
+if [[ -f "${token}" ]]; then
+    extra_args+=(
+      --publish-results "https://cvm-base.aisec.fraunhofer.de:8080/results?category=garden"
+      --publish-token "${token}"
+    )
+fi
+policy="${dir}/config/cmcctl-policy.js"
+if [[ -f "${policy}" ]]; then
+    extra_args+=(
+      --policy-engine js
+      --policies "${policy}"
+      --policy-overwrite=true
+    )
+fi
+
+# Store the attestation result in .cmc/results without overwriting previous results
+out="${dir}/.cmc/results"
+mkdir -p "${out}"
+result="${out}/atls-attestation-result.json"
+run=1
+while [[ -e "${result}" ]]; do
+  result="${out}/atls-attestation-result-${run}.json"
+  run=$((run + 1))
+done
+
+scratch="$(mktemp -d)"
+
+printf "[test-atls] Dialing %s via attested TLS\n" "${addr}"
+
+dial_rc=0
+timeout 60 "${cmcctl}" dial \
+  --api libapi \
+  --addr "${addr}" \
+  --attest server \
+  --attestation-only-trust \
+  --result "${result}" \
+  --root-cas "${ca}" \
+  --serialization cbor \
+  --hash-alg SHA256 \
+  --endorsement-mode direct \
+  --enrollment-mode self \
+  --storage "${scratch}" \
+  --allow-system-certs=true \
+  "${extra_args[@]}" \
+  "$@" || dial_rc=$?
+
+[[ "${dial_rc}" -eq 0 ]] || {
+    printf "[test-atls] aTLS connection to %s failed (cmcctl exit code %d)\n" "${addr}" "${dial_rc}"
+    exit "${dial_rc}"
+}
+
+[[ -f "${result}" ]] || {
+    printf "[test-atls] No attestation result was written to %s\n" "${result}"
+    exit 1
+}
+
+status="$(jq -r '.summary.status // "unknown"' "${result}")"
+
+printf "[test-atls] Attestation result (%s) written to %s\n" "${status}" "${result}"
+
+printf "[test-atls] Verification of %s: %s\n" "${addr}" "${status}"
+
+if [[ "${status}" == "fail" ]]; then
+    exit 1
+elif [[ "${status}" == "warn" ]]; then
+    printf "[\033[33;1mWARN\033[0m] aTLS connection to %s with warning\n" "${addr}"
+    exit 0
+elif [[ "${status}" == "success" ]]; then
+    printf "[\033[32;1mPASSED\033[0m] aTLS connection to %s\n" "${addr}"
+    exit 0
+else
+    printf "[test-atls] Unknown attestation result status: %s\n" "${status}"
+    exit 1
+fi
